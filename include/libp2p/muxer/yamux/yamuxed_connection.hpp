@@ -35,7 +35,7 @@ namespace libp2p::connection {
     YamuxedConnection &operator=(const YamuxedConnection &other) = delete;
     YamuxedConnection(YamuxedConnection &&other) = delete;
     YamuxedConnection &operator=(YamuxedConnection &&other) = delete;
-    ~YamuxedConnection() override = default;
+    ~YamuxedConnection() override;
 
     /**
      * Create a new YamuxedConnection instance
@@ -79,7 +79,7 @@ namespace libp2p::connection {
     void deferWriteCallback(std::error_code ec, WriteCallbackFunc cb) override;
 
    private:
-    using Streams = std::unordered_map<StreamId, std::shared_ptr<YamuxStream>>;
+    using Streams = std::unordered_map<StreamId, std::weak_ptr<YamuxStream>>;
 
     using PendingOutboundStreams =
         std::unordered_map<StreamId, StreamHandlerFunc>;

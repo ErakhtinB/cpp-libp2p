@@ -39,14 +39,14 @@ namespace libp2p::connection {
   };
 
   /// Stream implementation, used by Yamux multiplexer
-  class YamuxStream final : public Stream,
-                            public std::enable_shared_from_this<YamuxStream> {
+  class YamuxStream : public Stream,
+                      public std::enable_shared_from_this<YamuxStream> {
    public:
     YamuxStream(const YamuxStream &other) = delete;
     YamuxStream &operator=(const YamuxStream &other) = delete;
     YamuxStream(YamuxStream &&other) = delete;
     YamuxStream &operator=(YamuxStream &&other) = delete;
-    ~YamuxStream() override = default;
+    ~YamuxStream() override;
 
     YamuxStream(std::shared_ptr<connection::SecureConnection> connection,
                 YamuxStreamFeedback &feedback,

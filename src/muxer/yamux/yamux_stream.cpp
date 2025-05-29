@@ -316,8 +316,11 @@ namespace libp2p::connection {
   }
 
   void YamuxStream::doClose(std::error_code ec, bool notify_read_side) {
-    // ensure lifetime of this object during doClose
+    // ensure lifetime of this object during doClose - critical for preventing
+    // use-after-free
     auto self = shared_from_this();
+
+    // Prevent double-close
     if (close_reason_) {
       // already closed
       return;
@@ -345,20 +348,37 @@ namespace libp2p::connection {
     VoidResultHandlerFunc window_size_cb;
     window_size_cb.swap(window_size_cb_);
 
+    // Execute callbacks with proper exception handling
     if (read_cb_and_res.first) {
-      read_cb_and_res.first(read_cb_and_res.second);
+      try {
+        read_cb_and_res.first(read_cb_and_res.second);
+      } catch (...) {
+        log()->error("Exception in read callback during stream close");
+      }
     }
 
     for (const auto &cb : write_callbacks) {
-      cb(ec);
+      try {
+        cb(ec);
+      } catch (...) {
+        log()->error("Exception in write callback during stream close");
+      }
     }
 
     if (window_size_cb) {
-      window_size_cb(ec);
+      try {
+        window_size_cb(ec);
+      } catch (...) {
+        log()->error("Exception in window size callback during stream close");
+      }
     }
 
     if (close_cb_and_res.first) {
-      close_cb_and_res.first(close_cb_and_res.second);
+      try {
+        close_cb_and_res.first(close_cb_and_res.second);
+      } catch (...) {
+        log()->error("Exception in close callback during stream close");
+      }
     }
   }
 
@@ -494,6 +514,25 @@ namespace libp2p::connection {
 
     write_queue_.enqueue(in.first(bytes), std::move(cb));
     doWrite();
+  }
+
+  YamuxStream::~YamuxStream() {
+    // Ensure proper cleanup to prevent memory leaks
+    if (!close_reason_) {
+      // If stream wasn't properly closed, reset it
+      if (is_readable_ || is_writable_) {
+        feedback_.resetStream(stream_id_);
+      }
+    }
+
+    // Clear all callbacks to prevent dangling references
+    read_cb_ = nullptr;
+    close_cb_ = nullptr;
+    window_size_cb_ = nullptr;
+
+    // Clear internal buffers
+    internal_read_buffer_.clear();
+    write_queue_.clear();
   }
 
 }  // namespace libp2p::connection

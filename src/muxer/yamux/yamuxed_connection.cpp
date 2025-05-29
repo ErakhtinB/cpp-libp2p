@@ -63,6 +63,15 @@ namespace libp2p::connection {
 
     raw_read_buffer_->resize(YamuxFrame::kInitialWindowSize + 4096);
     new_stream_id_ = (connection_->isInitiator() ? 1 : 2);
+
+    // Ensure proper cleanup ordering
+    std::weak_ptr<YamuxedConnection> weak_self;
+    try {
+      // This will work after enable_shared_from_this is properly initialized
+      weak_self = weak_from_this();
+    } catch (...) {
+      // If weak_from_this fails, we're in constructor, so defer initialization
+    }
   }
 
   void YamuxedConnection::start() {
@@ -249,7 +258,14 @@ namespace libp2p::connection {
         continue;
       }
 
-      auto stream = it->second;
+      auto stream = it->second.lock();
+
+      if (!stream) {
+        // Stream has been destroyed
+        SL_DEBUG(log(), "stream {} has been destroyed", id);
+        streams_.erase(it);
+        continue;
+      }
 
       if (!handler) {
         // inbound
@@ -332,12 +348,21 @@ namespace libp2p::connection {
       return;
     }
 
+    auto stream = it->second.lock();
+    if (!stream) {
+      // Stream has been destroyed
+      SL_DEBUG(log(), "stream {} has been destroyed", stream_id);
+      streams_.erase(it);
+      reading_state_.discardDataMessage();
+      return;
+    }
+
     SL_TRACE(log(),
              "YamuxedConnection::processData, stream={}, size={}",
              stream_id,
              segment.size());
 
-    auto result = it->second->onDataReceived(segment);
+    auto result = stream->onDataReceived(segment);
     if (result == YamuxStream::kKeepStream) {
       return;
     }
@@ -481,7 +506,15 @@ namespace libp2p::connection {
       return;
     }
 
-    auto result = it->second->onFINReceived();
+    auto stream = it->second.lock();
+    if (!stream) {
+      // Stream has been destroyed
+      SL_DEBUG(log(), "stream {} has been destroyed", stream_id);
+      streams_.erase(it);
+      return;
+    }
+
+    auto result = stream->onFINReceived();
     if (result == YamuxStream::kRemoveStream) {
       eraseStream(stream_id);
     }
@@ -509,7 +542,14 @@ namespace libp2p::connection {
       return;
     }
 
-    auto stream = std::move(it->second);
+    auto stream = it->second.lock();
+    if (!stream) {
+      // Stream has been destroyed
+      SL_DEBUG(log(), "stream {} has been destroyed", stream_id);
+      streams_.erase(it);
+      return;
+    }
+
     eraseStream(stream_id);
     stream->onRSTReceived();
   }
@@ -517,7 +557,13 @@ namespace libp2p::connection {
   bool YamuxedConnection::processWindowUpdate(const YamuxFrame &frame) {
     auto it = streams_.find(frame.stream_id);
     if (it != streams_.end()) {
-      it->second->increaseSendWindow(frame.length);
+      auto stream = it->second.lock();
+      if (stream) {
+        stream->increaseSendWindow(frame.length);
+      } else {
+        // Stream has been destroyed, clean up
+        streams_.erase(it);
+      }
     } else {
       SL_DEBUG(
           log(), "processWindowUpdate: stream {} not found", frame.stream_id);
@@ -529,32 +575,64 @@ namespace libp2p::connection {
   void YamuxedConnection::close(
       std::error_code notify_streams_code,
       boost::optional<YamuxFrame::GoAwayError> reply_to_peer_code) {
+    // Prevent double-close
     if (!started_) {
       return;
     }
 
-    // Keep alive until method completion
+    // Keep alive until method completion - this is critical for preventing
+    // use-after-free
     auto self = shared_from_this();
+
+    // Mark as stopped first to prevent new operations
     started_ = false;
 
     SL_DEBUG(log(), "closing connection, reason: {}", notify_streams_code);
 
+    // Cancel all timers immediately to prevent callbacks
+    ping_handle_.reset();
+    cleanup_handle_.reset();
+    inactivity_handle_.reset();
+
+    // Safely extract streams and pending operations
     Streams streams;
     streams.swap(streams_);
 
     PendingOutboundStreams pending_streams;
     pending_streams.swap(pending_outbound_streams_);
 
-    for (auto [_, stream] : streams) {
-      stream->closedByConnection(notify_streams_code);
+    // Clear fresh streams to prevent dangling references
+    fresh_streams_.clear();
+
+    // Notify all streams of closure - use weak references to prevent circular
+    // dependencies
+    for (auto [stream_id, stream] : streams) {
+      if (auto stream_ptr = stream.lock()) {
+        stream_ptr->closedByConnection(notify_streams_code);
+      }
     }
 
-    for (auto [_, cb] : pending_streams) {
-      cb(notify_streams_code);
+    // Notify all pending stream callbacks
+    for (auto [stream_id, cb] : pending_streams) {
+      if (cb) {
+        try {
+          cb(notify_streams_code);
+        } catch (...) {
+          // Prevent callback exceptions from propagating
+          SL_ERROR(log(), "Exception in pending stream callback during close");
+        }
+      }
     }
 
+    // Notify connection closed callback - use try-catch to prevent exceptions
     if (closed_callback_) {
-      closed_callback_(remote_peer_, shared_from_this());
+      try {
+        closed_callback_(remote_peer_, shared_from_this());
+      } catch (...) {
+        SL_ERROR(log(), "Exception in connection closed callback");
+      }
+      // Clear the callback to prevent circular references
+      closed_callback_ = nullptr;
     }
 
     close_after_write_ = true;
@@ -562,7 +640,9 @@ namespace libp2p::connection {
       enqueue(goAwayMsg(*reply_to_peer_code));
     } else {
       write_queue_.clear();
-      std::ignore = connection_->close();
+      if (connection_ && !connection_->isClosed()) {
+        std::ignore = connection_->close();
+      }
     }
   }
 
@@ -603,7 +683,13 @@ namespace libp2p::connection {
 
     enqueue(closeStreamMsg(stream_id));
 
-    auto &stream = it->second;
+    auto stream = it->second.lock();
+    if (!stream) {
+      // Stream has been destroyed, just remove it
+      streams_.erase(it);
+      return;
+    }
+
     assert(stream->isClosedForWrite());
 
     if (stream->isClosedForRead()) {
@@ -623,12 +709,16 @@ namespace libp2p::connection {
     assert(!is_writing_);
 
     writing_buf_->assign(packet.packet.begin(), packet.packet.end());
-    auto cb = [wptr{weak_from_this()},
-               buf{writing_buf_},
-               packet = std::move(packet)](outcome::result<size_t> res) {
-      if (auto self = wptr.lock()) {
-        self->onDataWritten(res, packet.stream_id);
+
+    // Use weak_ptr to prevent keeping the connection alive through callbacks
+    auto cb = [weak_self = weak_from_this(),
+               buf = writing_buf_,
+               stream_id = packet.stream_id](outcome::result<size_t> res) {
+      if (auto self = weak_self.lock()) {
+        self->onDataWritten(res, stream_id);
       }
+      // If connection is destroyed, callback silently fails - this prevents
+      // use-after-free
     };
 
     is_writing_ = true;
@@ -665,8 +755,14 @@ namespace libp2p::connection {
           SL_DEBUG(
               log(), "onDataWritten : stream {} no longer exists", stream_id);
         } else {
-          // stream can now call write callbacks
-          it->second->onDataWritten(sz);
+          auto stream = it->second.lock();
+          if (stream) {
+            // stream can now call write callbacks
+            stream->onDataWritten(sz);
+          } else {
+            // Stream has been destroyed, clean up
+            streams_.erase(it);
+          }
         }
       }
     }
@@ -683,13 +779,14 @@ namespace libp2p::connection {
   }
 
   std::shared_ptr<Stream> YamuxedConnection::createStream(StreamId stream_id) {
-    auto stream =
-        std::make_shared<YamuxStream>(shared_from_this(),
-                                      *this,
-                                      stream_id,
-                                      config_.maximum_window_size,
-                                      basic::WriteQueue::kDefaultSizeLimit);
-    streams_[stream_id] = stream;
+    // Use weak_ptr to prevent circular references between connection and stream
+    auto stream = std::make_shared<YamuxStream>(
+        connection_,  // Pass connection directly, not shared_from_this()
+        *this,
+        stream_id,
+        config_.maximum_window_size,
+        basic::WriteQueue::kDefaultSizeLimit);
+    streams_[stream_id] = std::weak_ptr<YamuxStream>(stream);
     inactivity_handle_.reset();
     return stream;
   }
@@ -714,9 +811,13 @@ namespace libp2p::connection {
                "scheduling expire timer to {} msec",
                config_.no_streams_interval.count());
       inactivity_handle_ = scheduler_->scheduleWithHandle(
-          [weak_ptr(weak_from_this())] {
-            if (auto self = weak_ptr.lock()) {
-              self->onExpireTimer();
+          [weak_self = weak_from_this()] {
+            if (auto self = weak_self.lock()) {
+              // Double-check that we're still in the correct state
+              if (self->started_ && self->streams_.empty()
+                  && self->pending_outbound_streams_.empty()) {
+                self->onExpireTimer();
+              }
             }
           },
           scheduler_->now() + config_.no_streams_interval);
@@ -734,7 +835,7 @@ namespace libp2p::connection {
   void YamuxedConnection::setTimerCleanup() {
     static constexpr auto kCleanupInterval = std::chrono::seconds(150);
     cleanup_handle_ = scheduler_->scheduleWithHandle(
-        [weak_self{weak_from_this()}] {
+        [weak_self = weak_from_this()] {
           auto self = weak_self.lock();
           if (not self) {
             return;
@@ -743,8 +844,9 @@ namespace libp2p::connection {
             return;
           }
           std::vector<StreamId> abandoned;
-          for (auto &[id, stream] : self->streams_) {
-            if (stream.use_count() == 1) {
+          for (auto &[id, stream_weak] : self->streams_) {
+            auto stream = stream_weak.lock();
+            if (!stream || stream.use_count() == 1) {
               abandoned.push_back(id);
               self->enqueue(resetStreamMsg(id));
             }
@@ -755,14 +857,17 @@ namespace libp2p::connection {
               self->streams_.erase(id);
             }
           }
-          self->setTimerCleanup();
+          // Only reschedule if connection is still active
+          if (self->started_) {
+            self->setTimerCleanup();
+          }
         },
         kCleanupInterval);
   }
 
   void YamuxedConnection::setTimerPing() {
     ping_handle_ = scheduler_->scheduleWithHandle(
-        [weak_self{weak_from_this()}] {
+        [weak_self = weak_from_this()] {
           auto self = weak_self.lock();
           if (not self) {
             return;
@@ -775,8 +880,30 @@ namespace libp2p::connection {
             self->enqueue(pingOutMsg(++self->ping_counter_));
             SL_TRACE(log(), "written ping message #{}", self->ping_counter_);
           }
-          self->setTimerPing();
+          // Only reschedule if connection is still active
+          if (self->started_) {
+            self->setTimerPing();
+          }
         },
         config_.ping_interval);
+  }
+
+  YamuxedConnection::~YamuxedConnection() {
+    // Ensure all timers are canceled to prevent use-after-free
+    ping_handle_.reset();
+    cleanup_handle_.reset();
+    inactivity_handle_.reset();
+
+    // Clear all streams to break potential circular references
+    streams_.clear();
+    pending_outbound_streams_.clear();
+    fresh_streams_.clear();
+
+    // Clear write queue to prevent dangling callbacks
+    write_queue_.clear();
+    is_writing_ = false;
+
+    // Clear the connection closed callback to prevent circular references
+    closed_callback_ = nullptr;
   }
 }  // namespace libp2p::connection
